@@ -7,6 +7,7 @@
 
 #import "FilePickerUtils.h"
 #import "FileInfo.h"
+#import <AVFoundation/AVFoundation.h>
 
 @implementation FilePickerUtils
 
@@ -101,67 +102,93 @@
     return files;
 }
 
-+ (NSURL*) exportMusicAsset:(NSString*) url withName:(NSString *)name {
-    AVURLAsset *songAsset = [AVURLAsset URLAssetWithURL: (NSURL*)url options:nil];
-    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset: songAsset
-                                                                      presetName:AVAssetExportPresetAppleM4A];
-    
-    exporter.outputFileType =   @"com.apple.m4a-audio";
-    
-    NSString* savePath = [NSTemporaryDirectory() stringByAppendingPathComponent:[name stringByAppendingString:@".m4a"]];
-    NSURL *exportURL = [NSURL fileURLWithPath:savePath];
-    
-    if ([[NSFileManager defaultManager] fileExistsAtPath:savePath]) {
-        return exportURL;
++ (void) exportMusicAsset:(NSURL*)url withName:(NSString*)name completion:(void (^)(NSURL* exportedUrl))completion {
+    // Cloud-only and DRM protected items carry no asset URL, so there is
+    // nothing to export. Reported rather than skipped silently, so the caller
+    // can tell the difference between "nothing picked" and "nothing usable".
+    if(url == nil) {
+        Log(@"Couldn't retrieve the audio file path, either it is not locally downloaded or the file is DRM protected.");
+        completion(nil);
+        return;
     }
-    
-    exporter.outputURL = exportURL;
-    
-    dispatch_queue_t queue = dispatch_queue_create("exportQueue", 0);
-    
-    dispatch_async(queue, ^{
-        
-        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-        
-        [exporter exportAsynchronouslyWithCompletionHandler:
-         ^{
-            
-            switch (exporter.status)
-            {
-                case AVAssetExportSessionStatusFailed:
-                {
-                    NSError *exportError = exporter.error;
-                    Log(@"AVAssetExportSessionStatusFailed: %@", exportError);
-                    break;
-                }
-                case AVAssetExportSessionStatusCompleted:
-                {
-                    Log(@"AVAssetExportSessionStatusCompleted");
-                    @autoreleasepool {
-                        dispatch_semaphore_signal(semaphore);
-                    }
-                    
-                    break;
-                }
-                case AVAssetExportSessionStatusCancelled:
-                {
-                    Log(@"AVAssetExportSessionStatusCancelled");
-                    @autoreleasepool {
-                        dispatch_semaphore_signal(semaphore);
-                    }
-                    break;
-                }
-                default:
-                {
-                    Log(@"didn't get export status");
-                    break;
-                }
+
+    NSString * outputFileType = @"com.apple.m4a-audio";
+    AVURLAsset * asset = [AVURLAsset URLAssetWithURL:url options:nil];
+    NSURL * outputUrl = [self exportDestinationForName:name];
+
+    if(outputUrl == nil) {
+        completion(nil);
+        return;
+    }
+
+    [AVAssetExportSession determineCompatibilityOfExportPreset:AVAssetExportPresetAppleM4A
+                                                    withAsset:asset
+                                               outputFileType:outputFileType
+                                            completionHandler:^(BOOL compatible) {
+        if(!compatible) {
+            Log(@"The m4a export preset is not compatible with the picked asset.");
+            completion(nil);
+            return;
+        }
+
+        AVAssetExportSession * exporter = [AVAssetExportSession exportSessionWithAsset:asset
+                                                                           presetName:AVAssetExportPresetAppleM4A];
+        exporter.outputFileType = outputFileType;
+        exporter.outputURL = outputUrl;
+
+        [exporter exportAsynchronouslyWithCompletionHandler:^{
+            // Every status other than Completed is a failure for our purposes,
+            // and the default covers the ones that should never reach a
+            // completion handler - leaving the caller waiting forever is worse
+            // than reporting a miss.
+            if(exporter.status == AVAssetExportSessionStatusCompleted) {
+                completion(outputUrl);
+            } else {
+                Log(@"AVAssetExportSession failed to export: %@", exporter.error.localizedDescription);
+                completion(nil);
             }
         }];
-        
-        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-    });
-    return exportURL;
+    }];
+}
+
+// Builds the file to export into: `<tmp>/file_picker_music/<uuid>/<name>.m4a`.
+//
+// The name is kept because callers surface it to the user, and the uuid
+// directory is what makes keeping it safe: two picked tracks can share a
+// title, and AVAssetExportSession refuses to write over an existing file, so a
+// shared directory would either collide or hand back a stale export left
+// behind by an interrupted run.
++ (NSURL*) exportDestinationForName:(NSString*)name {
+    NSString * fileName = [self sanitizeFileName:name];
+    NSString * directory = [[NSTemporaryDirectory() stringByAppendingPathComponent:@"file_picker_music"]
+                            stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+
+    NSError * error = nil;
+    if(![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:&error]) {
+        Log(@"Couldn't create the export directory: %@", error.localizedDescription);
+        return nil;
+    }
+
+    return [NSURL fileURLWithPath:[directory stringByAppendingPathComponent:
+                                   [fileName stringByAppendingPathExtension:@"m4a"]]];
+}
+
+// Track titles are free text and reach us verbatim: a slash in one (`AC/DC`,
+// `Us/Them`) would otherwise be read as a path separator, pointing the export
+// at a directory that does not exist. `:` goes too - it is the separator the
+// Finder still shows paths with, and it survives round trips badly.
++ (NSString*) sanitizeFileName:(NSString*)name {
+    if(name.length == 0) {
+        return @"audio";
+    }
+
+    NSCharacterSet * illegal = [NSCharacterSet characterSetWithCharactersInString:@"/:"];
+    NSString * sanitized = [[name componentsSeparatedByCharactersInSet:illegal] componentsJoinedByString:@"_"];
+
+    return sanitized.length > 0 ? sanitized : @"audio";
 }
 
 @end

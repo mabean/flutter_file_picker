@@ -24,7 +24,13 @@ typedef NS_ENUM(NSInteger, MediaType) {
 + (NSArray<NSString*>*) resolveType:(NSString*)type withAllowedExtensions:(NSArray<NSString*>*)allowedExtensions;
 + (MediaType) resolveMediaType:(NSString*)type;
 + (NSArray<NSDictionary*>*) resolveFileInfo:(NSArray<NSURL *> *)urls withData:(BOOL)loadData;
-+ (NSURL*) exportMusicAsset:(NSString*)url withName: (NSString*)name;
+// Exports an ipod-library asset to a temporary m4a file.
+//
+// The export is asynchronous: `completion` is called exactly once, off the
+// main thread, with the exported file's URL, or nil when the item cannot be
+// exported at all - a cloud-only item that was never downloaded, a DRM
+// protected one, or an asset the m4a preset cannot handle.
++ (void) exportMusicAsset:(NSURL*)url withName:(NSString*)name completion:(void (^)(NSURL* exportedUrl))completion;
 @end
 
 

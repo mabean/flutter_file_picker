@@ -1,4 +1,5 @@
 #import "FilePickerPlugin.h"
+#import <AVFoundation/AVFoundation.h>
 #import "FilePickerUtils.h"
 #import "ImageUtils.h"
 #import <Flutter/Flutter.h>
@@ -652,32 +653,109 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
 - (void)mediaPicker: (MPMediaPickerController *)mediaPicker didPickMediaItems:(MPMediaItemCollection *)mediaItemCollection
 {
     [mediaPicker dismissViewControllerAnimated:YES completion:NULL];
-    int numberOfItems = (int)[mediaItemCollection items].count;
-    
-    if(numberOfItems == 0) {
+
+    if(_result == nil) {
         return;
     }
-    
+
+    NSArray<MPMediaItem *> * items = [self distinctItemsIn:mediaItemCollection];
+
+    if(items.count == 0) {
+        [self handleResult:@[]];
+        return;
+    }
+
     if(_eventSink != nil) {
         _eventSink([NSNumber numberWithBool:YES]);
     }
-    
-    NSMutableArray<NSURL *> * urls = [[NSMutableArray alloc] initWithCapacity:numberOfItems];
-    
-    for(MPMediaItemCollection * item in [mediaItemCollection items]) {
-        NSURL * cachedAsset = [FilePickerUtils exportMusicAsset: [item valueForKey:MPMediaItemPropertyAssetURL] withName: [item valueForKey:MPMediaItemPropertyTitle]];
-        [urls addObject: cachedAsset];
+
+    // Exporting is asynchronous and finishes out of order, so each item gets a
+    // reserved slot: the caller is handed the paths in the order they were
+    // picked, and items that cannot be exported drop out of the middle without
+    // shifting the rest.
+    NSMutableArray * exported = [[NSMutableArray alloc] initWithCapacity:items.count];
+    for(NSUInteger index = 0; index < items.count; index++) {
+        [exported addObject:[NSNull null]];
     }
-    
-    if(_eventSink != nil) {
-        _eventSink([NSNumber numberWithBool:NO]);
-    }
-    
-    if(urls.count == 0) {
-        Log(@"Couldn't retrieve the audio file path, either is not locally downloaded or the file is DRM protected.");
-    }
-    [self handleResult:urls];
+
+    // Completion handlers land on whatever thread the export ran on, and
+    // NSMutableArray is not safe to mutate from several at once.
+    NSLock * lock = [[NSLock alloc] init];
+    dispatch_group_t group = dispatch_group_create();
+
+    [items enumerateObjectsUsingBlock:^(MPMediaItem * item, NSUInteger index, BOOL * stop) {
+        dispatch_group_enter(group);
+
+        [FilePickerUtils exportMusicAsset:[item valueForProperty:MPMediaItemPropertyAssetURL]
+                                 withName:[item valueForProperty:MPMediaItemPropertyTitle]
+                               completion:^(NSURL * exportedUrl) {
+            if(exportedUrl != nil) {
+                [lock lock];
+                [exported replaceObjectAtIndex:index withObject:exportedUrl];
+                [lock unlock];
+            }
+
+            // Balances the enter above on every path, including the failures:
+            // a missed leave would leave the notify below waiting forever and
+            // the pick would never return.
+            dispatch_group_leave(group);
+        }];
+    }];
+
+    // Main queue because both the event sink and the result have to be called
+    // from the platform thread.
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        if(self->_eventSink != nil) {
+            self->_eventSink([NSNumber numberWithBool:NO]);
+        }
+
+        [lock lock];
+        NSMutableArray<NSURL *> * urls = [[NSMutableArray alloc] initWithCapacity:exported.count];
+        for(id exportedUrl in exported) {
+            if(exportedUrl != [NSNull null]) {
+                [urls addObject:exportedUrl];
+            }
+        }
+        [lock unlock];
+
+        if(urls.count != items.count) {
+            Log(@"Couldn't retrieve the audio file path for %lu of %lu picked items.",
+                (unsigned long)(items.count - urls.count), (unsigned long)items.count);
+        }
+
+        // The picker can be dismissed while exports are still running, which
+        // clears the result - calling it then would send on a nil block.
+        if(self.result == nil) {
+            return;
+        }
+
+        [self handleResult:urls];
+    });
 }
+
+// The picker hands back a collection that can hold the same track twice, and
+// exporting it twice would return two paths to the same audio. Order is kept:
+// the first occurrence wins.
+- (NSArray<MPMediaItem *> *) distinctItemsIn:(MPMediaItemCollection *)collection {
+    NSMutableArray<MPMediaItem *> * items = [[NSMutableArray alloc] init];
+    NSMutableSet<NSNumber *> * seen = [[NSMutableSet alloc] init];
+
+    for(MPMediaItem * item in collection.items) {
+        NSNumber * identifier = [item valueForProperty:MPMediaItemPropertyPersistentID];
+
+        if(identifier != nil) {
+            if([seen containsObject:identifier]) {
+                continue;
+            }
+            [seen addObject:identifier];
+        }
+
+        [items addObject:item];
+    }
+
+    return items;
+}
+
 #endif // PICKER_AUDIO
 
 #pragma mark - Actions canceled
