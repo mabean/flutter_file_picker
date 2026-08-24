@@ -370,7 +370,11 @@
     self.audioPickerController = [[MPMediaPickerController alloc] initWithMediaTypes:MPMediaTypeAnyAudio];
     self.audioPickerController.delegate = self;
     self.audioPickerController.presentationController.delegate = self;
-    self.audioPickerController.showsCloudItems = YES;
+    // Neither can be exported - a cloud item was never downloaded and a
+    // protected one is encrypted - so offering them only lets the user pick
+    // something that cannot come back.
+    self.audioPickerController.showsCloudItems = NO;
+    self.audioPickerController.showsItemsWithProtectedAssets = NO;
     self.audioPickerController.allowsPickingMultipleItems = isMultiPick;
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
